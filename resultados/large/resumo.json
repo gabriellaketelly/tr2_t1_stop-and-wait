@@ -1,0 +1,25 @@
+{
+  "grupo": "grupo08",
+  "arquivo": "large",
+  "servidor": "137.131.178.229",
+  "porta": 8080,
+  "file_size": 10485760,
+  "segment_size": 512,
+  "total_segments": 20480,
+  "seed": "rdtunb_grupo08_2026_10",
+  "md5_esperado": "e4de8c5bbc4161ed42b7af19bc05e188",
+  "md5_recebido": "e4de8c5bbc4161ed42b7af19bc05e188",
+  "checksum_ok": true,
+  "done_ok": true,
+  "duracao_s": 884.8937204160029,
+  "rtt_medio_s": 0.0425667392054334,
+  "amostras_rtt": 20477,
+  "throughput_medido_bps": 94797.91534803048,
+  "throughput_teorico_bps": 96225.36460291441,
+  "retransmissoes": 3,
+  "segmentos_com_timeout": 3,
+  "timeout_s": 2.0,
+  "avisos_servidor": [
+    "ack_nao_suportado"
+  ]
+}
