@@ -6,3 +6,4 @@ resultados/**/*.bin
 resultados/**/*.part
 resultados_*/**/*.bin
 resultados_*/**/*.part
+resultados/gbn/
