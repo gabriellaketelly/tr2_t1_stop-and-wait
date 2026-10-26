@@ -1,0 +1,23 @@
+{
+  "grupo": "grupo08",
+  "arquivo": "small",
+  "servidor": "127.0.0.1",
+  "porta": 8080,
+  "file_size": 1048576,
+  "segment_size": 512,
+  "total_segments": 2048,
+  "seed": "rdt-local",
+  "md5_esperado": "0fa1e7c56911792f29beef58f652deec",
+  "md5_recebido": "0fa1e7c56911792f29beef58f652deec",
+  "checksum_ok": true,
+  "done_ok": true,
+  "duracao_s": 0.22226469999441179,
+  "rtt_medio_s": 7.238369141049361e-05,
+  "amostras_rtt": 2048,
+  "throughput_medido_bps": 37741521.70907439,
+  "throughput_teorico_bps": 56587332.31455773,
+  "retransmissoes": 0,
+  "segmentos_com_timeout": 0,
+  "timeout_s": 2.0,
+  "avisos_servidor": []
+}
