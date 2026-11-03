@@ -247,6 +247,14 @@ def baixar_sr(sock, args, info):
     print("Transferência concluída; iniciando finalização...", flush=True)
     done = finalizar(sock, checksum, args, avisos)
 
+    rtt_medio = sum(rtts) / len(rtts) if rtts else None
+
+    throughput_teorico = (
+        janela * info["segment_size"] * 8 / rtt_medio
+        if rtt_medio else None
+    )
+
+
     resumo = {
         "protocolo": "SR",
         "grupo": args.group,
@@ -263,10 +271,11 @@ def baixar_sr(sock, args, info):
         "checksum_ok": checksum_ok,
         "done_ok": done,
         "duracao_s": duracao,
-        "rtt_medio_s": sum(rtts) / len(rtts) if rtts else None,
+        "rtt_medio_s": rtt_medio,
         "throughput_medido_bps": (
             bytes_recebidos * 8 / duracao if duracao > 0 else 0
         ),
+        "throughput_teorico_bps": throughput_teorico,
         "retransmissoes": retransmissoes_total,
         "timeouts": timeouts_total,
         "timeout_s": args.timeout,
