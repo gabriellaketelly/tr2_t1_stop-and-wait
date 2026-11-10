@@ -9,239 +9,201 @@ from pathlib import Path
 import socket
 import time
 
-
-class ProtocolError(Exception):
-    pass
-
-
-def identifier(value):
-    if not value or not value.isascii() or any(c in value for c in "|=\r\n"):
-        raise argparse.ArgumentTypeError("identificador vazio ou com delimitadores inválidos")
-    return value
-
-
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", default="137.131.178.229")
-    parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--group", required=True, type=identifier)
-    parser.add_argument("--file", choices=("small", "medium", "large"), default="small")
-    parser.add_argument("--segment-size", type=int, default=512)
-    parser.add_argument("--timeout", type=float, default=2.0)
-    parser.add_argument("--max-retries", type=int, default=10)
-    parser.add_argument("--output-dir", type=Path, default=Path("resultados"))
-    args = parser.parse_args(argv)
-    if not 1 <= args.segment_size <= 512:
-        parser.error("--segment-size deve estar entre 1 e 512")
-    if not math.isfinite(args.timeout) or args.timeout <= 0 or args.max_retries < 0:
-        parser.error("timeout deve ser positivo e max-retries não negativo")
-    if not 1 <= args.port <= 65535:
-        parser.error("porta inválida")
-    return args
+from registro_metricas import COLUNAS_METRICAS, campos_csv_enunciado, nomear_csv_metricas
+from simulacao_perdas import SimuladorPerdas
+from protocolo_rdt import (
+    ErroProtocolo,
+    confirmacao_nao_suportada,
+    finalizar,
+    interpretar_dados,
+    negociar_sessao,
+    trocar_mensagem,
+    validar_identificador,
+)
 
 
-def parse_fields(packet, kind):
-    try:
-        parts = packet.decode("ascii").split("|")
-        if parts[0] != kind:
-            raise ValueError("tipo inesperado")
-        fields = {}
-        for part in parts[1:]:
-            key, value = part.split("=", 1)
-            if key in fields:
-                raise ValueError("campo duplicado")
-            fields[key] = value
-        return fields
-    except (UnicodeError, ValueError) as exc:
-        raise ProtocolError(f"{kind} inválido: {exc}") from exc
+def analisar_argumentos(lista_argumentos=None):
+    analisador = argparse.ArgumentParser(description=__doc__)
+    analisador.add_argument("--server", default="137.131.178.229")
+    analisador.add_argument("--port", type=int, default=8080)
+    analisador.add_argument("--group", required=True, type=validar_identificador)
+    analisador.add_argument("--file", choices=("small", "medium", "large"), default="small")
+    analisador.add_argument("--segment-size", type=int, default=512)
+    analisador.add_argument(
+        "--timeout", type=float, default=0.5,
+        help="timeout fixo em segundos (padrão 0.5, cerca de 4× o p99 RTT medido no servidor)",
+    )
+    analisador.add_argument("--max-retries", type=int, default=10)
+    analisador.add_argument("--loss-rate", type=float, default=0.0,
+                            help="probabilidade de descartar DATA no receptor, entre 0 e 1")
+    analisador.add_argument("--loss-seed", type=int,
+                            help="semente opcional para repetir os descartes simulados")
+    analisador.add_argument("--output-dir", type=Path, default=Path("resultados"))
+    argumentos = analisador.parse_args(lista_argumentos)
+    if not 1 <= argumentos.segment_size <= 512:
+        analisador.error("--segment-size deve estar entre 1 e 512")
+    if (not math.isfinite(argumentos.timeout) or argumentos.timeout <= 0
+            or argumentos.max_retries < 0):
+        analisador.error("timeout deve ser positivo e max-retries não negativo")
+    if not math.isfinite(argumentos.loss_rate) or not 0 <= argumentos.loss_rate <= 1:
+        analisador.error("--loss-rate deve estar entre 0 e 1")
+    if not 1 <= argumentos.port <= 65535:
+        analisador.error("porta inválida")
+    return argumentos
 
 
-def ack_nao_suportado(packet, avisos):
-    """Reconhece apenas a incompatibilidade de ACK observada no servidor."""
-    if packet.rstrip() != b"ERROR|msg=tipo_desconhecido_ACK":
-        return False
-    if avisos is not None and "ack_nao_suportado" not in avisos:
-        avisos.add("ack_nao_suportado")
-        print("Aviso: servidor rejeita ACK; mantendo envio conforme o enunciado.", flush=True)
-    return True
-
-
-def exchange(sock, message, expected, timeout, max_retries, avisos=None):
-    for attempt in range(max_retries + 1):
-        sock.send(message)
-        deadline = time.perf_counter() + timeout
+def receber_segmento(conexao, sequencia, tamanho_esperado, tamanho_arquivo,
+                     timeout_segundos, max_retransmissoes, avisos=None,
+                     metadados=None, inicio_transferencia=None, perdas=None):
+    inicio = time.perf_counter()
+    req_timestamp_epoch = ""
+    perdas_simuladas = 0
+    for tentativa in range(max_retransmissoes + 1):
+        req_timestamp_epoch = f"{time.time():.9f}"
+        conexao.send(f"REQ|seq={sequencia}".encode("ascii"))
+        prazo = time.perf_counter() + timeout_segundos
         while True:
-            remaining = deadline - time.perf_counter()
-            if remaining <= 0:
+            tempo_restante = prazo - time.perf_counter()
+            if tempo_restante <= 0:
                 break
-            sock.settimeout(remaining)
+            conexao.settimeout(tempo_restante)
             try:
-                packet = sock.recv(65507)
+                pacote = conexao.recv(65507)
             except socket.timeout:
                 break
-            if packet.startswith(expected + b"|"):
-                return parse_fields(packet, expected.decode("ascii"))
-            if packet.startswith(b"ERROR"):
-                if ack_nao_suportado(packet, avisos):
+            if pacote.startswith(b"ERROR"):
+                if confirmacao_nao_suportada(pacote, avisos):
                     continue
-                raise ProtocolError(packet.decode("ascii", errors="replace"))
-    raise TimeoutError(f"Sem {expected.decode()} após {max_retries + 1} tentativas")
-
-
-def handshake(sock, args):
-    hello = (f"HELLO|grupo={args.group}|segment_size={args.segment_size}"
-             f"|file={args.file}").encode("ascii")
-    fields = exchange(sock, hello, b"OK", args.timeout, args.max_retries)
-    try:
-        info = {key: int(fields[key]) for key in
-                ("file_size", "total_segments", "segment_size")}
-        checksum = fields["checksum"].lower()
-        if len(checksum) != 32 or any(c not in "0123456789abcdef" for c in checksum):
-            raise ValueError("MD5 inválido")
-        if info["file_size"] <= 0 or not 1 <= info["segment_size"] <= 512:
-            raise ValueError("tamanho inválido")
-        if info["total_segments"] != math.ceil(info["file_size"] / info["segment_size"]):
-            raise ValueError("quantidade de segmentos inconsistente")
-        info.update(checksum=checksum, seed=fields.get("seed"))
-        return info
-    except (KeyError, ValueError) as exc:
-        raise ProtocolError(f"Parâmetros do OK inválidos: {exc}") from exc
-
-
-def parse_data(packet):
-    try:
-        kind, sequence, total, payload = packet.split(b"|", 3)
-        if kind != b"DATA" or not sequence.startswith(b"seq=") or not total.startswith(b"total="):
-            raise ValueError("cabeçalho inesperado")
-        seq = int(sequence[4:])
-        size = int(total[6:])
-        if seq < 0 or size < 0:
-            raise ValueError("valor negativo")
-        return seq, size, payload
-    except ValueError as exc:
-        raise ProtocolError(f"DATA inválido: {exc}") from exc
-
-
-def receber_segmento(sock, seq, expected_size, file_size, timeout, max_retries, avisos=None):
-    started = time.perf_counter()
-    for attempt in range(max_retries + 1):
-        sock.send(f"REQ|seq={seq}".encode("ascii"))
-        deadline = time.perf_counter() + timeout
-        while True:
-            remaining = deadline - time.perf_counter()
-            if remaining <= 0:
-                break
-            sock.settimeout(remaining)
+                raise ErroProtocolo(pacote.decode("ascii", errors="replace"))
             try:
-                packet = sock.recv(65507)
-            except socket.timeout:
-                break
-            if packet.startswith(b"ERROR"):
-                if ack_nao_suportado(packet, avisos):
-                    continue
-                raise ProtocolError(packet.decode("ascii", errors="replace"))
-            try:
-                received_seq, total, payload = parse_data(packet)
-            except ProtocolError:
+                sequencia_recebida, tamanho_total, conteudo = interpretar_dados(pacote)
+            except ErroProtocolo:
                 continue
             # A especificação não esclarece se total é o tamanho do arquivo
             # ou do payload. Aceitamos ambos, validando o payload pelo OK.
-            if received_seq != seq or len(payload) != expected_size:
+            if sequencia_recebida != sequencia or len(conteudo) != tamanho_esperado:
                 continue
-            if total not in (expected_size, file_size):
+            if tamanho_total not in (tamanho_esperado, tamanho_arquivo):
                 continue
-            elapsed = time.perf_counter() - started
-            return payload, {
-                "seq": seq, "bytes": len(payload),
-                "rtt_ms": elapsed * 1000 if attempt == 0 else "",
-                "tempo_segmento_ms": elapsed * 1000,
-                "throughput_bps": len(payload) * 8 / elapsed,
-                "retransmissoes": attempt, "timeout_ocorrido": int(attempt > 0),
+            if perdas is not None and perdas.descartar(sequencia, tentativa):
+                perdas_simuladas += 1
+                continue
+            tempo_decorrido = time.perf_counter() - inicio
+            recebido_timestamp_epoch = f"{time.time():.9f}"
+            linha = {
+                **(metadados or {}),
+                "seq": sequencia, "bytes": len(conteudo),
+                "rtt_ms": tempo_decorrido * 1000 if tentativa == 0 else "",
+                "tempo_segmento_ms": tempo_decorrido * 1000,
+                "throughput_bps": len(conteudo) * 8 / tempo_decorrido,
+                "retransmissoes": tentativa, "timeout_ocorrido": int(tentativa > 0),
+                "simulated_loss": perdas_simuladas,
+                "req_timestamp_epoch": req_timestamp_epoch,
+                "data_timestamp_epoch": recebido_timestamp_epoch,
+                "received_elapsed_s": (time.perf_counter() - inicio_transferencia
+                                        if inicio_transferencia is not None else ""),
+                "rtt_est_ms": "", "dev_rtt_ms": "", "timeout_ms": timeout_segundos * 1000,
+                "timeout_usado_ms": timeout_segundos * 1000,
+                "rtt_sample_valid": int(tentativa == 0),
+                **campos_csv_enunciado(
+                    sequencia, recebido_timestamp_epoch, len(conteudo), "",
+                    len(conteudo) * 8 / tempo_decorrido, tentativa, 1, "SAW",
+                ),
             }
-    raise TimeoutError(f"Segmento {seq}: limite de retransmissões atingido")
+            return conteudo, linha
+    raise TimeoutError(f"Segmento {sequencia}: limite de retransmissões atingido")
 
 
-def finalizar(sock, checksum, args, avisos=None):
-    fields = exchange(sock, f"FIN|checksum={checksum}".encode("ascii"),
-                      b"DONE", args.timeout, args.max_retries, avisos)
-    if fields.get("ok") not in ("0", "1"):
-        raise ProtocolError("DONE sem campo ok válido")
-    return fields["ok"] == "1"
-
-
-def baixar_arquivo(sock, args, info):
-    directory = args.output_dir / args.file
-    directory.mkdir(parents=True, exist_ok=True)
+def baixar_com_stop_and_wait(conexao, argumentos, informacoes):
+    diretorio = argumentos.output_dir / argumentos.file
+    diretorio.mkdir(parents=True, exist_ok=True)
     # Evita apresentar um resumo de execução anterior como resultado atual.
-    for name in ("resumo.json", "graficos.png", "graficos.pdf", "arquivo.bin"):
-        (directory / name).unlink(missing_ok=True)
-    digest = hashlib.md5()
-    rtts = []
-    retries = timeouts = received = 0
+    for nome in ("resumo.json", "graficos.png", "graficos.pdf", "arquivo.bin"):
+        (diretorio / nome).unlink(missing_ok=True)
+    calculador_md5 = hashlib.md5()
+    amostras_rtt = []
+    retransmissoes = expiracoes = bytes_recebidos = perdas_simuladas_total = 0
     avisos = set()
-    started = time.perf_counter()
-    columns = ("seq", "bytes", "rtt_ms", "tempo_segmento_ms", "throughput_bps",
-               "retransmissoes", "timeout_ocorrido")
-    partial = directory / "arquivo.part"
-    with partial.open("wb") as output, (directory / "metricas.csv").open("w", newline="") as metrics:
-        writer = csv.DictWriter(metrics, fieldnames=columns)
-        writer.writeheader()
-        for seq in range(info["total_segments"]):
-            expected = min(info["segment_size"], info["file_size"] - received)
-            payload, row = receber_segmento(sock, seq, expected, info["file_size"],
-                                            args.timeout, args.max_retries, avisos)
-            output.write(payload)
-            digest.update(payload)
-            received += len(payload)
-            sock.send(f"ACK|seq={seq}".encode("ascii"))
-            writer.writerow(row)
-            if row["rtt_ms"] != "":
-                rtts.append(row["rtt_ms"] / 1000)
-            retries += row["retransmissoes"]
-            timeouts += row["timeout_ocorrido"]
-            if (seq + 1) % 100 == 0 or seq + 1 == info["total_segments"]:
-                print(f"{args.file}: {seq + 1}/{info['total_segments']} segmentos", flush=True)
-    duration = time.perf_counter() - started
-    checksum = digest.hexdigest()
-    local_ok = received == info["file_size"] and checksum == info["checksum"]
-    done = finalizar(sock, checksum, args, avisos)
-    mean_rtt = sum(rtts) / len(rtts) if rtts else None
-    summary = {
-        "grupo": args.group, "arquivo": args.file, "servidor": args.server,
-        "porta": args.port, "file_size": received, "segment_size": info["segment_size"],
-        "total_segments": info["total_segments"], "seed": info["seed"],
-        "md5_esperado": info["checksum"], "md5_recebido": checksum,
-        "checksum_ok": local_ok, "done_ok": done, "duracao_s": duration,
-        "rtt_medio_s": mean_rtt, "amostras_rtt": len(rtts),
-        "throughput_medido_bps": received * 8 / duration,
-        "throughput_teorico_bps": info["segment_size"] * 8 / mean_rtt if mean_rtt else None,
-        "retransmissoes": retries, "segmentos_com_timeout": timeouts,
-        "timeout_s": args.timeout,
+    perdas = SimuladorPerdas(argumentos.loss_rate, argumentos.loss_seed)
+    inicio = time.perf_counter()
+    inicio_epoch = time.time()
+    metadados = {"grupo": argumentos.group, "servidor": argumentos.server,
+                 "porta": argumentos.port, "arquivo": argumentos.file, "protocolo": "SAW"}
+    arquivo_parcial = diretorio / "arquivo.part"
+    with arquivo_parcial.open("wb") as arquivo_saida, (diretorio / "metricas.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as arquivo_metricas:
+        escritor = csv.DictWriter(arquivo_metricas, fieldnames=COLUNAS_METRICAS)
+        escritor.writeheader()
+        for sequencia in range(informacoes["total_segments"]):
+            tamanho_esperado = min(
+                informacoes["segment_size"], informacoes["file_size"] - bytes_recebidos,
+            )
+            conteudo, linha = receber_segmento(
+                conexao, sequencia, tamanho_esperado, informacoes["file_size"],
+                argumentos.timeout, argumentos.max_retries, avisos,
+                metadados=metadados, inicio_transferencia=inicio, perdas=perdas,
+            )
+            arquivo_saida.write(conteudo)
+            calculador_md5.update(conteudo)
+            bytes_recebidos += len(conteudo)
+            conexao.send(f"ACK|seq={sequencia}".encode("ascii"))
+            escritor.writerow(linha)
+            if linha["rtt_ms"] != "":
+                amostras_rtt.append(linha["rtt_ms"] / 1000)
+            retransmissoes += linha["retransmissoes"]
+            expiracoes += linha["timeout_ocorrido"]
+            perdas_simuladas_total += linha["simulated_loss"]
+            if (sequencia + 1) % 100 == 0 or sequencia + 1 == informacoes["total_segments"]:
+                print(f"{argumentos.file}: {sequencia + 1}/{informacoes['total_segments']} segmentos", flush=True)
+    duracao = time.perf_counter() - inicio
+    checksum = calculador_md5.hexdigest()
+    checksum_valido = bytes_recebidos == informacoes["file_size"] and checksum == informacoes["checksum"]
+    confirmado = finalizar(conexao, checksum, argumentos, avisos)
+    rtt_medio = sum(amostras_rtt) / len(amostras_rtt) if amostras_rtt else None
+    resumo = {
+        "grupo": argumentos.group, "arquivo": argumentos.file, "servidor": argumentos.server,
+        "porta": argumentos.port, "file_size": bytes_recebidos, "segment_size": informacoes["segment_size"],
+        "total_segments": informacoes["total_segments"], "seed": informacoes["seed"],
+        "md5_esperado": informacoes["checksum"], "md5_recebido": checksum,
+        "checksum_ok": checksum_valido, "done_ok": confirmado, "duracao_s": duracao,
+        "rtt_medio_s": rtt_medio, "amostras_rtt": len(amostras_rtt),
+        "throughput_medido_bps": bytes_recebidos * 8 / duracao,
+        "throughput_teorico_bps": informacoes["segment_size"] * 8 / rtt_medio if rtt_medio else None,
+        "retransmissoes": retransmissoes, "segmentos_com_timeout": expiracoes,
+        "timeout_s": argumentos.timeout,
+        "loss_rate": argumentos.loss_rate, "loss_seed": argumentos.loss_seed,
+        "simulated_loss_total": perdas_simuladas_total,
+        "metrics_file": nomear_csv_metricas(
+            diretorio / "metricas.csv", argumentos.group, "saw", inicio_epoch,
+        ),
         "avisos_servidor": sorted(avisos),
     }
-    (directory / "resumo.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
-    if not local_ok or not done:
-        raise ProtocolError("Integridade não confirmada; consulte resumo.json")
-    partial.replace(directory / "arquivo.bin")
-    return summary
+    (diretorio / "resumo.json").write_text(
+        json.dumps(resumo, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+    )
+    if not checksum_valido or not confirmado:
+        raise ErroProtocolo("Integridade não confirmada; consulte resumo.json")
+    arquivo_parcial.replace(diretorio / "arquivo.bin")
+    return resumo
 
 
-def main(argv=None):
-    args = parse_args(argv)
+def principal(lista_argumentos=None):
+    argumentos = analisar_argumentos(lista_argumentos)
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as conexao:
             # connect em UDP fixa o peer; não cria uma conexão TCP.
-            sock.connect((args.server, args.port))
-            info = handshake(sock, args)
-            print(f"Sessão: {info['file_size']} bytes, segmento {info['segment_size']} bytes")
-            summary = baixar_arquivo(sock, args, info)
-            print(f"MD5: {summary['md5_recebido']} — DONE|ok=1")
-            print(f"Throughput: {summary['throughput_medido_bps']:.2f} bit/s")
+            conexao.connect((argumentos.server, argumentos.port))
+            informacoes = negociar_sessao(conexao, argumentos)
+            print(f"Sessão: {informacoes['file_size']} bytes, segmento {informacoes['segment_size']} bytes")
+            resumo = baixar_com_stop_and_wait(conexao, argumentos, informacoes)
+            print(f"MD5: {resumo['md5_recebido']} — DONE|ok=1")
+            print(f"Throughput: {resumo['throughput_medido_bps']:.2f} bit/s")
         return 0
-    except (OSError, ProtocolError, TimeoutError, UnicodeError) as exc:
-        print(f"Erro: {exc}")
+    except (OSError, ErroProtocolo, TimeoutError, UnicodeError) as erro:
+        print(f"Erro: {erro}")
         return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(principal())

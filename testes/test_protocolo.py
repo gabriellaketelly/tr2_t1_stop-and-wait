@@ -11,19 +11,19 @@ from unittest.mock import Mock
 import cliente
 
 
-class ProtocolTests(unittest.TestCase):
+class TestesProtocolo(unittest.TestCase):
     def test_payload_binario(self):
         payload = b'a|b\x00\xff|'
-        self.assertEqual(cliente.parse_data(b'DATA|seq=2|total=6|' + payload), (2, 6, payload))
+        self.assertEqual(cliente.interpretar_dados(b'DATA|seq=2|total=6|' + payload), (2, 6, payload))
 
     def test_cabecalho_invalido(self):
         for packet in (b'DATA|seq=x|total=2|ab', b'DATA|seq=-1|total=2|ab', b'PONG'):
-            with self.assertRaises(cliente.ProtocolError):
-                cliente.parse_data(packet)
+            with self.assertRaises(cliente.ErroProtocolo):
+                cliente.interpretar_dados(packet)
 
     def test_grupo_obrigatorio(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            cliente.parse_args([])
+            cliente.analisar_argumentos([])
 
     def test_udp_com_perda_e_sequencia_errada(self):
         content = b'ab|\xff012345'
@@ -65,7 +65,7 @@ class ProtocolTests(unittest.TestCase):
         thread.start()
         with tempfile.TemporaryDirectory() as temporary:
             with contextlib.redirect_stdout(io.StringIO()):
-                result = cliente.main(['--server', '127.0.0.1', '--port', str(port), '--group', 'grupo08', '--timeout', '0.05', '--output-dir', temporary])
+                result = cliente.principal(['--server', '127.0.0.1', '--port', str(port), '--group', 'grupo08', '--timeout', '0.05', '--output-dir', temporary])
             thread.join(4)
             self.assertFalse(thread.is_alive())
             self.assertEqual(errors, [])
@@ -82,8 +82,8 @@ class ProtocolTests(unittest.TestCase):
     def test_apenas_erro_especifico_ack_tolerado(self):
         avisos = set()
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertTrue(cliente.ack_nao_suportado(b'ERROR|msg=tipo_desconhecido_ACK ', avisos))
-        self.assertFalse(cliente.ack_nao_suportado(b'ERROR|msg=sessao_invalida', avisos))
+            self.assertTrue(cliente.confirmacao_nao_suportada(b'ERROR|msg=tipo_desconhecido_ACK ', avisos))
+        self.assertFalse(cliente.confirmacao_nao_suportada(b'ERROR|msg=sessao_invalida', avisos))
 
     def test_limite_de_tentativas_segmento(self):
         sock = Mock()
@@ -93,22 +93,22 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(sock.send.call_count, 3)
         self.assertTrue(all(call.args == (b'REQ|seq=7',) for call in sock.send.call_args_list))
 
-    def test_limite_de_tentativas_handshake(self):
+    def test_limite_de_tentativas_negociacao(self):
         sock = Mock()
         sock.recv.side_effect = socket.timeout
         with self.assertRaises(TimeoutError):
-            cliente.exchange(sock, b'HELLO', b'OK', .1, 2)
+            cliente.trocar_mensagem(sock, b'HELLO', b'OK', .1, 2)
         self.assertEqual(sock.send.call_count, 3)
 
-    def verificar_falha_integridade(self, expected_md5, done):
+    def verificar_falha_integridade(self, md5_esperado, finalizacao):
         with tempfile.TemporaryDirectory() as temporary:
-            args = cliente.parse_args(['--group', 'grupo08', '--output-dir', temporary])
+            args = cliente.analisar_argumentos(['--group', 'grupo08', '--output-dir', temporary])
             sock = Mock()
-            sock.recv.side_effect = [b'DATA|seq=0|total=4|abcd', done]
+            sock.recv.side_effect = [b'DATA|seq=0|total=4|abcd', finalizacao]
             info = dict(file_size=4, total_segments=1, segment_size=4,
-                        checksum=expected_md5, seed='teste')
-            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(cliente.ProtocolError):
-                cliente.baixar_arquivo(sock, args, info)
+                        checksum=md5_esperado, seed='teste')
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(cliente.ErroProtocolo):
+                cliente.baixar_com_stop_and_wait(sock, args, info)
             directory = Path(temporary) / 'small'
             self.assertFalse((directory / 'arquivo.bin').exists())
             self.assertTrue((directory / 'arquivo.part').exists())
@@ -127,7 +127,7 @@ class ProtocolTests(unittest.TestCase):
     def test_erro_servidor_nao_e_ignorado(self):
         sock = Mock()
         sock.recv.return_value = b'ERROR|msg=sessao_invalida'
-        with self.assertRaises(cliente.ProtocolError):
+        with self.assertRaises(cliente.ErroProtocolo):
             cliente.receber_segmento(sock, 0, 4, 4, .1, 2)
         self.assertEqual(sock.send.call_count, 1)
 

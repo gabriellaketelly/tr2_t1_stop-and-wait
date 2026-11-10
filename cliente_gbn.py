@@ -1,319 +1,220 @@
-import argparse
+"""Cliente Go-Back-N UDP com timeout fixo ou RTT adaptativo."""
+
 import csv
 import hashlib
 import json
-import math 
-import random
 import socket
 import time
-from pathlib import Path
 
-from cliente import (
-    ProtocolError,
-    identifier,
-    handshake,
-    parse_data,
-    ack_nao_suportado,
+from protocolo_rdt import (
+    ErroProtocolo,
+    confirmacao_nao_suportada,
     finalizar,
+    interpretar_dados,
+    negociar_sessao,
 )
+from configuracao_clientes import analisar_argumentos, tamanho_segmento
+from registro_metricas import (COLUNAS_METRICAS, RegistroEventos,
+                               campos_csv_enunciado, nomear_csv_metricas)
+from rtt import EstimadorRTT
+from simulacao_perdas import SimuladorPerdas
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", default="137.131.178.229")
-    parser.add_argument("--port", type=int, default = 8080)
-    parser.add_argument("--group", required=True, type=identifier)
-    parser.add_argument("--file", choices=("small", "medium", "large"), default="small")
-    parser.add_argument("--segment-size", type=int, default=512)
-    parser.add_argument("--timeout", type=float, default=2.0)
-    parser.add_argument("--max-retries", type=int, default=10)
-    parser.add_argument("--window-size", type=int, choices=(4,8,16), default =4)
-    parser.add_argument("--loss-rate", type=float, default=0.0)
-    parser.add_argument("--output-dir", type=Path, default=Path("resultados"))
 
-    args = parser.parse_args(argv)
+def baixar_com_go_back_n(conexao, argumentos, informacoes):
+    total, janela = informacoes["total_segments"], argumentos.window_size
+    diretorio = argumentos.output_dir / "gbn" / argumentos.file
+    diretorio.mkdir(parents=True, exist_ok=True)
+    for nome in ("arquivo.bin", "arquivo.part", "metricas.csv", "eventos.csv", "resumo.json"):
+        (diretorio / nome).unlink(missing_ok=True)
 
-    if not 1 <= args.segment_size <= 512:
-        parser.error("--segment-size deve estar entre 1 e 512")
-    if not math.isfinite(args.timeout) or args.timeout <= 0:
-        parser.error("--timeout deve ser positivo")
-    if args.max_retries < 0:
-        parser.error("--max-retries não pode ser negativo")
-    if not 1 <= args.port <= 65535:
-        parser.error("porta inválida")
-    if not 0 <= args.loss_rate <= 1:
-        parser.error("--loss-rate deve estar entre 0 e 1")
-
-    return args
-
-def tamanho_segmento(seq, info):
-    restante = info["file_size"] - seq * info["segment_size"]
-    return min(info["segment_size"], restante)
-
-def baixar_gbn(sock, args, info):
-    total = info["total_segments"]
-    janela = args.window_size
-
-    directory = args.output_dir / "gbn" / args.file
-    directory.mkdir(parents=True, exist_ok=True)
-
-    for name in ("arquivo.bin", "arquivo.part", "metricas.csv", "resumo.json"):
-        (directory/name).unlink(missing_ok=True)
-
-    # Estado da janela
-    base = 0
-    next_seq = 0
-
-    # Número de envios de cada segmento, incluindo o envio inicial
-
-    tentativas = {seq: 0 for seq in range(total)}
-    primeiro_envio = {}
-    perdas_simuladas = {seq: 0 for seq in range(total)}
-
-    digest = hashlib.md5()
-    avisos = set()
-    rtts = []
-    retransmissoes_total = 0
-    timeouts_total = 0
-    bytes_recebidos = 0
-
-    colunas = (
-        "seq",
-        "bytes",
-        "rtt_ms",
-        "tempo_segmento_ms",
-        "throughput_bps",
-        "retransmissoes",
-        "timeout_ocorrido",
-        "simulated_loss",
-    )
-
-    def enviar_req(seq):
-        agora = time.perf_counter()
-
-        if tentativas[seq] == 0:
-            primeiro_envio[seq] = agora
-
-        tentativas[seq] += 1
-        sock.send(f"REQ|seq={seq}".encode("ascii"))
-
+    estimador = EstimadorRTT.a_partir_dos_argumentos(argumentos)
+    perdas = SimuladorPerdas(argumentos.loss_rate, getattr(argumentos, "loss_seed", None))
+    base = proxima_sequencia = 0
+    tentativas = [0] * total
+    primeiro_envio, ultimo_envio, instantes_req, timeouts_req = {}, {}, {}, {}
+    perdas_simuladas = [0] * total
+    calculador_md5, avisos, rtts = hashlib.md5(), set(), []
+    retransmissoes_total = total_expiracoes = bytes_recebidos = 0
     inicio = time.perf_counter()
-    base_timer = inicio
+    inicio_epoch = time.time()
+    timeout_ativo = estimador.timeout
+    arquivo_parcial = diretorio / "arquivo.part"
 
-    partial = directory / "arquivo.part"
+    with arquivo_parcial.open("wb") as arquivo_saida, (diretorio / "metricas.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as arquivo_metricas, (diretorio / "eventos.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as arquivo_eventos:
+        escritor = csv.DictWriter(arquivo_metricas, fieldnames=COLUNAS_METRICAS)
+        escritor.writeheader()
+        registro = RegistroEventos(arquivo_eventos, inicio)
 
-    with partial.open("wb") as output, (
-        directory / "metricas.csv"
-    ).open("w", newline="", encoding = "utf-8") as metrics:
+        def enviar_req(sequencia):
+            nonlocal retransmissoes_total
+            agora, instante_unix = time.perf_counter(), time.time()
+            if tentativas[sequencia] == 0:
+                primeiro_envio[sequencia] = agora
+            else:
+                retransmissoes_total += 1
+            tentativas[sequencia] += 1
+            ultimo_envio[sequencia] = agora
+            instantes_req[sequencia] = instante_unix
+            timeouts_req[sequencia] = timeout_ativo
+            conexao.send(f"REQ|seq={sequencia}".encode("ascii"))
+            registro.registrar(
+                "REQ", sequencia, tentativas[sequencia], timeout_ativo,
+                agora=agora, instante_unix=instante_unix,
+            )
 
-        writer = csv.DictWriter(metrics, fieldnames = colunas)
-        writer.writeheader()
+        def preencher_janela():
+            nonlocal proxima_sequencia
+            while proxima_sequencia < min(total, base + janela):
+                enviar_req(proxima_sequencia)
+                proxima_sequencia += 1
 
-        # Envio inicial: preenche a janela
-
-        while next_seq < total and next_seq < base + janela:
-            enviar_req(next_seq)
-            next_seq += 1
-
+        preencher_janela()
+        prazo = ultimo_envio[base] + timeout_ativo
         while base < total:
-            restante = args.timeout - (time.perf_counter() - base_timer)
-            sock.settimeout(max(restante, 0.001))
+            # Verificação explícita: tráfego inválido/duplicado não adia o temporizador.
+            tempo_restante = prazo - time.perf_counter()
+            if tempo_restante <= 0:
+                pendentes = range(base, proxima_sequencia)
+                for sequencia in pendentes:
+                    if tentativas[sequencia] - 1 >= argumentos.max_retries:
+                        raise TimeoutError(f"Segmento {sequencia}: limite de retransmissões atingido")
+                registro.registrar("TIMEOUT", base, tentativas[base], timeout_ativo,
+                          detalhe=f"janela={base}:{proxima_sequencia - 1}")
+                print(f"Timeout em {base}; retransmitindo {base} até {proxima_sequencia - 1}", flush=True)
+                # Um recuo por expiração da janela, sem alterar o estimador.
+                timeout_ativo = estimador.aplicar_recuo(timeout_ativo)
+                for sequencia in pendentes:
+                    enviar_req(sequencia)
+                total_expiracoes += 1
+                prazo = ultimo_envio[base] + timeout_ativo
+                continue
 
+            conexao.settimeout(tempo_restante)
             try:
-                packet = sock.recv(65507)
+                pacote = conexao.recv(65507)
+                recebido_em, instante_unix = time.perf_counter(), time.time()
             except socket.timeout:
-                pendentes = range(base, next_seq)
-
-                for seq in pendentes:
-                    if tentativas[seq] - 1 >= args.max_retries:
-                        raise TimeoutError(
-                            f"Segmento {seq}: limite de retransmissões atingido"
-                        )
-
-                print(
-                    f"Timeout em {base}; retransmitindo "
-                    f"os segmentos {base} até {next_seq - 1}",
-                    flush=True,
-                )
-
-                for seq in pendentes:
-                    enviar_req(seq)
-
-                retransmissoes_total += len(pendentes)
-                timeouts_total += 1
-                base_timer = time.perf_counter()
                 continue
-
-
-            if packet.startswith(b"ERROR"):
-                if ack_nao_suportado(packet, avisos):
+            if pacote.startswith(b"ERROR"):
+                if confirmacao_nao_suportada(pacote, avisos):
                     continue
-                raise ProtocolError(
-                    packet.decode("ascii", errors="replace")
-                )
-            
-            try: 
-                seq, tamanho_total, payload = parse_data(packet)
-
-            except ProtocolError:
+                raise ErroProtocolo(pacote.decode("ascii", errors="replace"))
+            try:
+                sequencia, tamanho_total, conteudo = interpretar_dados(pacote)
+            except ErroProtocolo:
+                continue
+            if not 0 <= sequencia < proxima_sequencia:
+                continue  # DATA sem REQ correspondente nunca é aceito.
+            tamanho_esperado = tamanho_segmento(sequencia, informacoes)
+            if (len(conteudo) != tamanho_esperado
+                    or tamanho_total not in (tamanho_esperado, informacoes["file_size"])):
+                continue
+            registro.registrar("DATA", sequencia, tentativas[sequencia], timeout_ativo,
+                      agora=recebido_em, instante_unix=instante_unix)
+            if sequencia < base:
+                continue
+            # O descarte acontece antes da política GBN, inclusive fora de ordem.
+            if perdas.descartar(sequencia, tentativas[sequencia]):
+                perdas_simuladas[sequencia] += 1
+                registro.registrar("DROP", sequencia, tentativas[sequencia], timeout_ativo, "simulated_loss",
+                          agora=recebido_em, instante_unix=instante_unix)
+                continue
+            if sequencia != base:
+                registro.registrar("DISCARD", sequencia, tentativas[sequencia], timeout_ativo, "out_of_order",
+                          agora=recebido_em, instante_unix=instante_unix)
                 continue
 
-            if not 0 <= seq < total:
-                continue
-
-            tamanho_esperado = tamanho_segmento(seq, info)
-
-            if len(payload) != tamanho_esperado:
-                continue
-
-            if tamanho_total not in (tamanho_esperado, info["file_size"]):
-                continue
-
-            if seq != base:
-                continue
-             # Simula perda de DATA no cliente, antes de processá-lo.
-            if random.random() < args.loss_rate:
-                perdas_simuladas[seq] += 1
-                continue
-
-            # GBN aceita somente o segmento esperado.
-        
-
-            agora = time.perf_counter()
-            tempo_segmento = agora - primeiro_envio[seq]
-            numero_retransmissoes = tentativas[seq] - 1
-
-            output.write(payload)
-            digest.update(payload)
-            bytes_recebidos += len(payload)
-
-            # Mantém o ACK previsto no enunciado.
-            # O servidor real pode responder com ERROR para esse ACK.
-            sock.send(f"ACK|seq={seq}".encode("ascii"))
-
-            row = {
-                "seq": seq,
-                "bytes": len(payload),
-                "rtt_ms": (
-                    tempo_segmento * 1000
-                    if tentativas[seq] == 1
-                    else ""
-                ),
-                "tempo_segmento_ms": tempo_segmento * 1000,
-                "throughput_bps": (
-                    len(payload) * 8 / tempo_segmento
-                    if tempo_segmento > 0
-                    else 0
-                ),
-                "retransmissoes": numero_retransmissoes,
-                "timeout_ocorrido": int(numero_retransmissoes > 0),
-                "simulated_loss": perdas_simuladas[seq],
+            tempo_decorrido = recebido_em - primeiro_envio[sequencia]
+            amostra_valida = tentativas[sequencia] == 1
+            if amostra_valida:
+                rtts.append(tempo_decorrido)
+                timeout_ativo = estimador.atualizar(tempo_decorrido)
+            vazao_segmento = len(conteudo) * 8 / tempo_decorrido if tempo_decorrido > 0 else 0
+            metricas_rtt = estimador.campos_metricas()
+            linha = {
+                "grupo": argumentos.group, "servidor": argumentos.server,
+                "porta": argumentos.port, "arquivo": argumentos.file, "protocolo": "GBN",
+                "seq": sequencia, "bytes": len(conteudo),
+                "rtt_ms": tempo_decorrido * 1000 if amostra_valida else "",
+                "tempo_segmento_ms": tempo_decorrido * 1000,
+                "throughput_bps": vazao_segmento,
+                "retransmissoes": tentativas[sequencia] - 1,
+                "timeout_ocorrido": int(tentativas[sequencia] > 1),
+                "simulated_loss": perdas_simuladas[sequencia],
+                "req_timestamp_epoch": f"{instantes_req[sequencia]:.9f}",
+                "data_timestamp_epoch": f"{instante_unix:.9f}",
+                "received_elapsed_s": recebido_em - inicio,
+                "timeout_usado_ms": timeouts_req[sequencia] * 1000,
+                "rtt_sample_valid": int(amostra_valida), **metricas_rtt,
+                **campos_csv_enunciado(sequencia, instante_unix, len(conteudo),
+                    metricas_rtt["rtt_est_ms"], vazao_segmento,
+                    tentativas[sequencia] - 1, janela, "GBN"),
             }
-            writer.writerow(row)
-
-            if row["rtt_ms"] != "":
-                rtts.append(row["rtt_ms"] / 1000)
-
+            escritor.writerow(linha)
+            arquivo_saida.write(conteudo)
+            calculador_md5.update(conteudo)
+            bytes_recebidos += len(conteudo)
+            conexao.send(f"ACK|seq={sequencia}".encode("ascii"))
             base += 1
-
-            # A janela avança e novos REQs podem ser enviados.
-            while next_seq < total and next_seq < base + janela:
-                enviar_req(next_seq)
-                next_seq += 1
-
-            # Reinicia o temporizador do segmento mais antigo pendente.
-            base_timer = time.perf_counter()
-
+            preencher_janela()
+            # ACK avança a base e arma um novo temporizador; prazos já ativos não
+            # são recalculados a cada passagem pelo laço.
+            prazo = recebido_em + timeout_ativo
             if base % 100 == 0 or base == total:
                 print(f"GBN: {base}/{total} segmentos", flush=True)
 
     duracao = time.perf_counter() - inicio
-    checksum = digest.hexdigest()
-    checksum_ok = (
-        bytes_recebidos == info["file_size"]
-        and checksum == info["checksum"]
+    md5 = calculador_md5.hexdigest()
+    md5_valido = bytes_recebidos == informacoes["file_size"] and md5 == informacoes["checksum"]
+    confirmado = finalizar(conexao, md5, argumentos, avisos)
+    metrics_file = nomear_csv_metricas(
+        diretorio / "metricas.csv", argumentos.group, "gbn", inicio_epoch,
     )
-
-    done = finalizar(sock, checksum, args, avisos)
-
-    rtt_medio = sum(rtts) / len(rtts) if rtts else None
-
-    throughput_teorico = (
-        janela * info["segment_size"] * 8 / rtt_medio
-        if rtt_medio else None
-    )
-
     resumo = {
-        "protocolo": "GBN",
-        "grupo": args.group,
-        "arquivo": args.file,
-        "servidor": args.server,
-        "porta": args.port,
-        "janela": janela,
-        "loss_rate": args.loss_rate,
-        "file_size": bytes_recebidos,
-        "segment_size": info["segment_size"],
-        "total_segments": total,
-        "md5_esperado": info["checksum"],
-        "md5_recebido": checksum,
-        "checksum_ok": checksum_ok,
-        "done_ok": done,
-        "duracao_s": duracao,
-        "rtt_medio_s": rtt_medio,
-        "throughput_medido_bps": (
-            bytes_recebidos * 8 / duracao if duracao > 0 else 0
-        ),
-        "throughput_teorico_bps": throughput_teorico,
-        "retransmissoes": retransmissoes_total,
-        "timeouts": timeouts_total,
-        "timeout_s": args.timeout,
-        "avisos_servidor": sorted(avisos),
+        "protocolo": "GBN", "grupo": argumentos.group, "arquivo": argumentos.file,
+        "servidor": argumentos.server, "porta": argumentos.port, "janela": janela,
+        "loss_rate": argumentos.loss_rate, "loss_seed": getattr(argumentos, "loss_seed", None),
+        "loss_method": "sha256_seq_attempt_v1" if perdas.semente is not None else "random",
+        "simulated_loss_total": sum(perdas_simuladas),
+        "file_size": bytes_recebidos, "segment_size": informacoes["segment_size"],
+        "total_segments": total, "seed": informacoes.get("seed"),
+        "md5_esperado": informacoes["checksum"], "md5_recebido": md5,
+        "checksum_ok": md5_valido, "done_ok": confirmado, "duracao_s": duracao,
+        "rtt_medio_s": sum(rtts) / len(rtts) if rtts else None,
+        "throughput_medido_bps": bytes_recebidos * 8 / duracao if duracao > 0 else 0,
+        "retransmissoes": retransmissoes_total, "timeouts": total_expiracoes,
+        "timeout_s": argumentos.timeout, "avisos_servidor": sorted(avisos),
+        "metrics_file": metrics_file,
+        **estimador.resumo(),
     }
-
-    (directory / "resumo.json").write_text(
-        json.dumps(resumo, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-
-    if not checksum_ok or not done:
-        raise ProtocolError(
-            "Integridade não confirmada; consulte resultados/gbn."
-        )
-
-    partial.replace(directory / "arquivo.bin")
+    (diretorio / "resumo.json").write_text(
+        json.dumps(resumo, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    if not md5_valido or not confirmado:
+        raise ErroProtocolo("Integridade não confirmada; consulte resumo.json")
+    arquivo_parcial.replace(diretorio / "arquivo.bin")
     return resumo
 
 
-def main(argv=None):
-    args = parse_args(argv)
-
+def principal(lista_argumentos=None):
+    argumentos = analisar_argumentos(lista_argumentos)
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect((args.server, args.port))
-            info = handshake(sock, args)
-
-            print(
-                f"Arquivo: {info['file_size']} bytes | "
-                f"Segmentos: {info['total_segments']} | "
-                f"Janela: {args.window_size}"
-            )
-
-            resumo = baixar_gbn(sock, args, info)
-
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as conexao:
+            conexao.connect((argumentos.server, argumentos.port))
+            informacoes = negociar_sessao(conexao, argumentos)
+            print(f"Arquivo: {informacoes['file_size']} bytes | Segmentos: {informacoes['total_segments']} "
+                  f"| Janela: {argumentos.window_size} | Timeout: {argumentos.timeout_mode}")
+            resumo = baixar_com_go_back_n(conexao, argumentos, informacoes)
             print(f"MD5: {resumo['md5_recebido']}")
-            print(
-                f"Throughput: "
-                f"{resumo['throughput_medido_bps']:.2f} bit/s"
-            )
-
+            print(f"Throughput: {resumo['throughput_medido_bps']:.2f} bit/s")
         return 0
-
-    except (OSError, ProtocolError, TimeoutError, UnicodeError) as exc:
-        print(f"Erro: {exc}")
+    except (OSError, ErroProtocolo, TimeoutError, UnicodeError) as erro:
+        print(f"Erro: {erro}")
         return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
-
-
-            
+    raise SystemExit(principal())
