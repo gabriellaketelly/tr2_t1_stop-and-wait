@@ -7,3 +7,8 @@ resultados/**/*.part
 resultados_*/**/*.bin
 resultados_*/**/*.part
 resultados/gbn/
+entrega-3/**/arquivo.bin
+entrega-3/**/arquivo.part
+entrega-3/**/*.aux
+entrega-3/**/*.out
+entrega-3/**/relatorio_final.log
